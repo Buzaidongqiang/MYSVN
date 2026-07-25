@@ -33,9 +33,10 @@ try:
         QFileDialog, QMessageBox, QGroupBox, QFormLayout, QHeaderView,
         QProgressBar, QStatusBar, QDialog, QDialogButtonBox, QStyleFactory,
         QCheckBox, QTreeWidget, QTreeWidgetItem, QMenu, QAction, QScrollArea,
+        QStyle, QInputDialog,
     )
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
+    from PyQt5.QtGui import QFont, QColor, QBrush
 except Exception as e:
     with open(log_file, "w", encoding="utf-8") as f:
         f.write(f"IMPORT ERROR: {e}\n{traceback.format_exc()}")
@@ -163,7 +164,7 @@ class UploadWorker(QThread):
 
     def __init__(self, server_url: str, folder: str, manifest: dict,
                  username: str, message: str, base_version: int, project_name: str,
-                 selected_files: list = None):
+                 selected_files: list = None, force: bool = False):
         super().__init__()
         self.server_url = server_url.rstrip("/")
         self.folder = folder
@@ -173,6 +174,7 @@ class UploadWorker(QThread):
         self.base_version = base_version
         self.project_name = project_name
         self.selected_files = selected_files
+        self.force = force
 
     def run(self):
         try:
@@ -194,7 +196,7 @@ class UploadWorker(QThread):
                 return
 
             conflicts = result.get("conflicts", [])
-            if conflicts:
+            if conflicts and not self.force:
                 file_list = "\n".join(f"  - {f}" for f in conflicts[:20])
                 extra = f"\n  ...还有 {len(conflicts)-20} 个冲突文件" if len(conflicts) > 20 else ""
                 self.error.emit(
@@ -700,6 +702,49 @@ def _guess_ext_category(rel_path: str) -> str:
     return f"{ext} 文件" if ext else "无后缀"
 
 
+class ConflictDialog(QDialog):
+    """冲突解决对话框 — 显示冲突文件，让用户选择强制覆盖或取消"""
+    def __init__(self, conflicts: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("检测到文件冲突")
+        self.resize(520, 360)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel(
+            "<b style='color:red;'>以下文件已被其他用户修改：</b>"))
+        layout.addWidget(QLabel(
+            "你的操作会覆盖他人的变更。建议先同步到最新版本后再修改。"))
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["冲突文件路径"])
+        tree.setAlternatingRowColors(True)
+        for f in conflicts[:50]:
+            item = QTreeWidgetItem(tree, [f])
+            item.setToolTip(0, f)
+        if len(conflicts) > 50:
+            QTreeWidgetItem(tree, [f"... 还有 {len(conflicts)-50} 个冲突文件"])
+        layout.addWidget(tree, 1)
+
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton("取消提交")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addStretch()
+
+        force_btn = QPushButton("强制覆盖提交")
+        force_btn.setStyleSheet(
+            "QPushButton { background-color: #e74c3c; color: white; "
+            "font-weight: bold; padding: 6px 16px; }"
+            "QPushButton:hover { background-color: #c0392b; }"
+        )
+        force_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(force_btn)
+
+        layout.addLayout(btn_layout)
+
+
 class CommitFileDialog(QDialog):
     """提交文件勾选对话框 — 目录树结构，内置 AI 备注"""
     def __init__(self, file_sizes: dict, need_upload: list, parent=None):
@@ -903,10 +948,17 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("MySVN", "Client")
         self.projects_registry = {}   # {project_name: {local_path, local_version, ...}}
         self.server_projects = []     # 服务端项目列表 [{name, latest_version, ...}]
+        self._offline_cache = []      # 离线模式缓存的版本列表
+        self._connected = False       # 心跳检测连接状态
 
         self._init_ui()
         self._restore_settings()
         self.setAcceptDrops(True)
+
+        # 心跳定时器
+        self.heartbeat_timer = QTimer(self)
+        self.heartbeat_timer.timeout.connect(self._heartbeat_check)
+        self.heartbeat_timer.start(30000)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -965,6 +1017,8 @@ class MainWindow(QMainWindow):
         self.proj_table.setMinimumHeight(100)
         self.proj_table.setMaximumHeight(200)
         self.proj_table.itemSelectionChanged.connect(self._on_project_selected)
+        self.proj_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.proj_table.customContextMenuRequested.connect(self._on_proj_menu)
         proj_layout.addWidget(self.proj_table)
 
         proj_btn_row = QHBoxLayout()
@@ -1010,10 +1064,12 @@ class MainWindow(QMainWindow):
         self.version_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.version_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.version_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.version_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.version_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.version_table.setAlternatingRowColors(True)
         self.version_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.version_table.customContextMenuRequested.connect(self._on_version_menu)
+        self.version_table.cellDoubleClicked.connect(self._on_version_double_clicked)
         list_layout.addWidget(self.version_table)
 
         self.refresh_btn = QPushButton("\U0001f504 刷新版本列表")
@@ -1106,8 +1162,16 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "选择本地工程文件夹")
         if folder:
             self.local_folder = folder
+            self.current_version = 0
             self.folder_info.setText(folder)
             self.project_name = os.path.basename(folder)
+            # 清理本地 manifest
+            manifest_p = Path(folder) / ".mysvn_manifest.json"
+            if manifest_p.exists():
+                try:
+                    manifest_p.unlink(missing_ok=True)
+                except Exception:
+                    pass
             # 更新注册表
             self.projects_registry[self.project_name] = {
                 "local_path": folder,
@@ -1171,8 +1235,16 @@ class MainWindow(QMainWindow):
     def _on_folder_dropped(self, folder: str):
         self.local_folder = folder
         self.project_name = os.path.basename(folder)
+        self.current_version = 0
         self.folder_info.setText(folder)
         self.project_info.setText(f"\U0001f4c1 {self.project_name}")
+        # 清理本地 manifest（服务端版本可能已被删除）
+        manifest_p = Path(folder) / ".mysvn_manifest.json"
+        if manifest_p.exists():
+            try:
+                manifest_p.unlink(missing_ok=True)
+            except Exception:
+                pass
         # 更新注册表
         self.projects_registry[self.project_name] = {
             "local_path": folder,
@@ -1185,20 +1257,100 @@ class MainWindow(QMainWindow):
         self._refresh_projects()
         self.status_bar.showMessage(f"已拖入工程: {self.project_name}")
 
+    # ------------------------------------------------------------------
+    # 心跳检测
+    # ------------------------------------------------------------------
+    def _heartbeat_check(self):
+        if not self.server_url:
+            return
+        try:
+            resp = requests.get(f"{self.server_url}/api/projects", timeout=3)
+            if resp.ok:
+                if not self._connected:
+                    self._connected = True
+                    self.conn_status.setText("已连接")
+                    self.conn_status.setStyleSheet("color: green;")
+                return
+        except Exception:
+            pass
+        # 连接丢失
+        if self._connected:
+            self._connected = False
+            self.conn_status.setText("连接断开")
+            self.conn_status.setStyleSheet("color: red; font-weight: bold;")
+            self.status_bar.showMessage("与服务器的连接已断开")
+            self._update_button_states()
+
     def _connect_server(self):
         addr = self.addr_edit.text().strip()
+        # 如果已连接，再次点击视为断开
+        if self.server_url:
+            self._disconnect_server()
+            return
         if not addr:
             self.conn_status.setText("请输入地址")
             return
         if not addr.startswith("http"):
             addr = f"http://{addr}"
         self.server_url = addr
+        self._connected = True
         self.conn_status.setText("已连接")
         self.conn_status.setStyleSheet("color: green;")
+        self.connect_btn.setText("断开连接")
         self._save_settings()
         self._update_button_states()
         self.status_bar.showMessage(f"已连接到 {addr}")
         self._refresh_projects()
+
+    def _disconnect_server(self):
+        self.server_url = ""
+        self._connected = False
+        self._offline_cache = []
+        self.conn_status.setText("未连接")
+        self.conn_status.setStyleSheet("color: red;")
+        self.connect_btn.setText("连接")
+        self.server_projects = []
+        self.proj_table.setRowCount(0)
+        self.version_table.setRowCount(0)
+        self._update_button_states()
+        self.status_bar.showMessage("已断开连接")
+
+    def _cache_path(self) -> Path:
+        return Path(__file__).parent.resolve() / ".mysvn_cache.json"
+
+    def _clear_offline_cache(self):
+        try:
+            if self._cache_path().exists():
+                self._cache_path().unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _save_offline_cache(self, versions: list):
+        try:
+            data = {
+                "project": self.project_name,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": time.time(),
+                "versions": versions,
+            }
+            self._cache_path().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_offline_cache(self) -> list:
+        try:
+            if self._cache_path().exists():
+                data = json.loads(self._cache_path().read_text(encoding="utf-8"))
+                # 缓存超过 1 小时视为过期，不加载
+                cache_time = data.get("timestamp", 0)
+                if time.time() - cache_time > 3600:
+                    self._clear_offline_cache()
+                    return []
+                if data.get("project") == self.project_name:
+                    return data.get("versions", [])
+        except Exception:
+            pass
+        return []
 
     def _refresh_versions(self):
         if not self.server_url or not self.project_name:
@@ -1218,10 +1370,28 @@ class MainWindow(QMainWindow):
             self.version_table.setItem(i, 3, QTableWidgetItem(v["message"]))
         if versions:
             self.current_version = int(versions[0]["id"])
+        else:
+            # 服务端已无版本（工程可能已被删除），重置版本号
+            self.current_version = 0
         self.status_bar.showMessage(f"已加载 {len(versions)} 个版本")
+        # 缓存到本地（离线模式）
+        self._offline_cache = versions
+        if versions:
+            self._save_offline_cache(versions)
+        else:
+            # 空版本列表时清理离线缓存，避免后续误加载旧数据
+            self._clear_offline_cache()
 
     def _on_versions_error(self, msg: str):
-        self.status_bar.showMessage(f"获取版本失败: {msg}")
+        # 尝试加载离线缓存
+        cached = self._load_offline_cache()
+        if cached:
+            self._on_versions_loaded(cached)
+            self.status_bar.showMessage(f"离线模式 — 已加载缓存版本（{len(cached)} 个版本）")
+            self.conn_status.setText("离线模式")
+            self.conn_status.setStyleSheet("color: orange;")
+        else:
+            self.status_bar.showMessage(f"获取版本失败: {msg}")
 
     # ------------------------------------------------------------------
     # 服务端工程列表
@@ -1301,8 +1471,172 @@ class MainWindow(QMainWindow):
             self._refresh_versions()
             self.status_bar.showMessage(f"已切换到工程: {proj_name}")
         else:
+            self.local_folder = ""
+            self.project_name = proj_name
+            self.current_version = 0
             self.project_info.setText(f"\U0001f4c1 {proj_name} (未部署)")
             self.folder_info.setText("点击「部署到本地」下载")
+            self._update_button_states()
+
+    # ------------------------------------------------------------------
+    # 工程表右键菜单
+    # ------------------------------------------------------------------
+    def _on_proj_menu(self, pos):
+        item = self.proj_table.itemAt(pos)
+        if not item:
+            return
+        row = item.row()
+        proj_name = self.proj_table.item(row, 0).text()
+
+        menu = QMenu(self)
+        action_deploy = QAction("部署到本地", self)
+        action_deploy.triggered.connect(self._deploy_project)
+        menu.addAction(action_deploy)
+
+        action_sync = QAction("同步到最新", self)
+        action_sync.triggered.connect(self._sync_to_latest)
+        menu.addAction(action_sync)
+
+        action_rename = QAction("重命名工程...", self)
+        action_rename.triggered.connect(lambda: self._rename_project(proj_name))
+        menu.addAction(action_rename)
+
+        menu.addSeparator()
+
+        # 打开本地路径（如果已部署）
+        reg = self.projects_registry.get(proj_name, {})
+        local_path = reg.get("local_path", "")
+        if local_path and os.path.isdir(local_path):
+            action_open = QAction("在资源管理器中打开", self)
+            action_open.triggered.connect(lambda: os.startfile(local_path))
+            menu.addAction(action_open)
+            menu.addSeparator()
+
+        action_delete = QAction("删除工程", self)
+        action_delete.triggered.connect(lambda: self._delete_project(proj_name))
+        action_delete.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        menu.addAction(action_delete)
+
+        menu.exec_(self.proj_table.viewport().mapToGlobal(pos))
+
+    def _rename_project(self, proj_name: str):
+        new_name, ok = QInputDialog.getText(
+            self, "重命名工程",
+            f"将「{proj_name}」重命名为:",
+            text=proj_name,
+        )
+        if not ok or not new_name.strip() or new_name.strip() == proj_name:
+            return
+        new_name = new_name.strip()
+
+        self.status_bar.showMessage(f"正在重命名工程...")
+        sv_url = self.server_url
+
+        class RenameWorker(QThread):
+            result = pyqtSignal(dict)
+
+            def run(self):
+                try:
+                    resp = requests.post(
+                        f"{sv_url}/api/rename_project",
+                        json={"old_name": proj_name, "new_name": new_name},
+                        timeout=HTTP_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    self.result.emit(resp.json())
+                except Exception as e:
+                    self.result.emit({"error": str(e)})
+
+        self.rename_worker = RenameWorker()
+        self.rename_worker.result.connect(lambda r: self._on_rename_result(r, proj_name, new_name))
+        self.rename_worker.start()
+
+    def _on_rename_result(self, result: dict, old_name: str, new_name: str):
+        if result.get("error"):
+            self.status_bar.showMessage("重命名失败")
+            QMessageBox.critical(self, "重命名失败", result["error"])
+            return
+
+        # 更新注册表
+        if old_name in self.projects_registry:
+            self.projects_registry[new_name] = self.projects_registry.pop(old_name)
+            self._save_settings()
+
+        # 如果当前工程就是这个，也更新
+        if self.project_name == old_name:
+            self.project_name = new_name
+            self.project_info.setText(f"\U0001f4c1 {new_name}")
+
+        self.status_bar.showMessage(f"工程已重命名: {old_name} → {new_name}")
+        self._refresh_projects()
+
+    def _delete_project(self, proj_name: str):
+        reply = QMessageBox.question(
+            self, "确认删除工程",
+            f"确定要永久删除工程「{proj_name}」及其所有版本吗？\n\n"
+            "此操作将从服务器上移除所有相关数据，不可撤销！",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.status_bar.showMessage(f"正在删除工程 {proj_name}...")
+        sv_url = self.server_url
+
+        class DeleteProjectWorker(QThread):
+            result = pyqtSignal(dict)
+
+            def run(self):
+                try:
+                    resp = requests.post(
+                        f"{sv_url}/api/delete_project/{proj_name}",
+                        timeout=HTTP_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    self.result.emit(resp.json())
+                except Exception as e:
+                    self.result.emit({"error": str(e)})
+
+        self.del_proj_worker = DeleteProjectWorker()
+        self.del_proj_worker.result.connect(lambda r: self._on_delete_project_result(r, proj_name))
+        self.del_proj_worker.start()
+
+    def _on_delete_project_result(self, result: dict, proj_name: str):
+        if result.get("error"):
+            self.status_bar.showMessage("删除失败")
+            QMessageBox.critical(self, "删除失败", result["error"])
+            return
+
+        # 从注册表中移除
+        reg = self.projects_registry.pop(proj_name, None)
+        self._save_settings()
+
+        # 清理本地 manifest（如果本地有对应文件夹）
+        if reg:
+            local_path = reg.get("local_path", "")
+            if local_path:
+                mp = Path(local_path) / ".mysvn_manifest.json"
+                if mp.exists():
+                    try:
+                        mp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # 如果当前选中的就是这个工程，清除状态
+        if self.project_name == proj_name:
+            self.local_folder = ""
+            self.project_name = ""
+            self.current_version = 0
+            self.folder_info.setText("")
+            self.project_info.setText("未选择工程")
+            self.version_table.setRowCount(0)
+
+        self.status_bar.showMessage(f"工程 {proj_name} 已删除（共 {result.get('deleted_versions', 0)} 个版本）")
+        QMessageBox.information(self, "删除成功",
+            f"工程「{proj_name}」已从服务器永久删除。\n"
+            f"共清理 {result.get('deleted_versions', 0)} 个版本。")
+        self._refresh_projects()
 
     # ------------------------------------------------------------------
     # 部署到本地
@@ -1359,13 +1693,13 @@ class MainWindow(QMainWindow):
                         zf.extractall(str(target))
                     self_.done.emit()
                 except requests.ConnectionError:
-                    self.error.emit("无法连接到服务器")
+                    self_.error.emit("无法连接到服务器")
                 except requests.Timeout:
-                    self.error.emit("下载超时，请重试")
+                    self_.error.emit("下载超时，请重试")
                 except zipfile.BadZipFile:
-                    self.error.emit("下载的版本文件已损坏")
+                    self_.error.emit("下载的版本文件已损坏")
                 except Exception as e:
-                    self.error.emit(f"部署失败: {str(e)}")
+                    self_.error.emit(f"部署失败: {str(e)}")
 
         self.dpl_worker = DeployWorker()
         self.dpl_worker.progress.connect(self._on_deploy_progress)
@@ -1457,7 +1791,9 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"扫描文件: {current}/{total}")
 
     def _on_scan_done(self, manifest: dict, file_sizes: dict):
-        self.status_bar.showMessage(f"扫描完成，共 {len(manifest)} 个文件，正在对比服务端...")
+        total_bytes = sum(file_sizes.get(f, 0) for f in manifest)
+        self.status_bar.showMessage(
+            f"扫描完成: {len(manifest)} 个文件, 合计 {_format_size(total_bytes)} — 正在对比服务端...")
         self._pending_manifest = manifest
         self._pending_file_sizes = file_sizes
 
@@ -1496,15 +1832,26 @@ class MainWindow(QMainWindow):
             return
 
         conflicts = result.get("conflicts", [])
+        need_upload = result.get("need_upload", [])
+
         if conflicts:
             file_list = "\n".join(f"  - {f}" for f in conflicts[:20])
             extra = f"\n  ...还有 {len(conflicts)-20} 个冲突文件" if len(conflicts) > 20 else ""
             self.status_bar.showMessage("检测到冲突")
-            QMessageBox.critical(self, "冲突检测",
-                f"以下文件已被其他用户修改，请先还原到最新版本再修改：\n{file_list}{extra}")
+
+            dlg = ConflictDialog(conflicts, self)
+            choice = dlg.exec_()
+            if choice == QDialog.Accepted:
+                # 用户选择强制覆盖
+                if not need_upload:
+                    QMessageBox.information(self, "提示", "没有检测到任何变更")
+                    return
+                dlg2 = CommitFileDialog(self._pending_file_sizes, need_upload, self)
+                if dlg2.exec_() == QDialog.Accepted and dlg2.confirmed:
+                    self._do_upload(self._pending_manifest, dlg2.message, dlg2.selected_files, force=True)
+            # 用户取消，什么也不做
             return
 
-        need_upload = result.get("need_upload", [])
         if not need_upload:
             self.status_bar.showMessage("没有变更")
             QMessageBox.information(self, "提示", "没有检测到任何变更")
@@ -1514,7 +1861,7 @@ class MainWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted and dlg.confirmed:
             self._do_upload(self._pending_manifest, dlg.message, dlg.selected_files)
 
-    def _do_upload(self, manifest: dict, message: str, selected_files: list = None):
+    def _do_upload(self, manifest: dict, message: str, selected_files: list = None, force: bool = False):
         self.commit_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(0)
@@ -1523,7 +1870,7 @@ class MainWindow(QMainWindow):
         self.upload_worker = UploadWorker(
             self.server_url, self.local_folder, manifest,
             self.username, message, self.current_version,
-            self.project_name, selected_files,
+            self.project_name, selected_files, force,
         )
         self.upload_worker.progress.connect(self._on_upload_progress)
         self.upload_worker.finished_upload.connect(self._on_upload_done)
@@ -1766,33 +2113,82 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 右键菜单
     # ------------------------------------------------------------------
+    def _on_version_double_clicked(self, row: int, column: int):
+        """双击版本行查看文件列表"""
+        version_id = int(self.version_table.item(row, 0).text())
+        version_msg = self.version_table.item(row, 3).text()
+        self._show_version_files(version_id, version_msg)
+
     def _on_version_menu(self, pos):
+        selected_rows = set()
+        for item in self.version_table.selectedItems():
+            selected_rows.add(item.row())
         item = self.version_table.itemAt(pos)
         if not item:
             return
-        row = item.row()
-        version_id = int(self.version_table.item(row, 0).text())
-        version_msg = self.version_table.item(row, 3).text()
+
+        # 如果右键的行不在已选列表中，选中它
+        click_row = item.row()
+        if click_row not in selected_rows:
+            self.version_table.selectRow(click_row)
+            selected_rows = {click_row}
+
+        version_ids = []
+        for r in selected_rows:
+            vid = int(self.version_table.item(r, 0).text())
+            version_ids.append(vid)
+        version_ids.sort(reverse=True)
+
+        primary_vid = version_ids[0]
+        primary_msg = self.version_table.item(click_row, 3).text()
 
         menu = QMenu(self)
-        action_restore = QAction("还原到当前文件夹", self)
-        action_restore.triggered.connect(lambda: self._rollback_version(version_id))
-        menu.addAction(action_restore)
 
-        action_download = QAction("下载到指定目录...", self)
-        action_download.triggered.connect(lambda: self._download_version(version_id))
-        menu.addAction(action_download)
+        if len(version_ids) == 1:
+            vid = primary_vid
+            action_restore = QAction("还原到当前文件夹", self)
+            action_restore.triggered.connect(lambda _a=None: self._rollback_version(vid))
+            menu.addAction(action_restore)
 
-        menu.addSeparator()
+            action_download = QAction("下载到指定目录...", self)
+            action_download.triggered.connect(lambda _a=None: self._download_version(vid))
+            menu.addAction(action_download)
 
-        action_files = QAction("查看文件列表", self)
-        action_files.triggered.connect(lambda: self._show_version_files(version_id, version_msg))
-        menu.addAction(action_files)
+            menu.addSeparator()
 
-        menu.addSeparator()
+            action_files = QAction("查看文件列表", self)
+            action_files.triggered.connect(lambda _a=None, _m=primary_msg: self._show_version_files(vid, _m))
+            menu.addAction(action_files)
 
-        action_delete = QAction("删除版本", self)
-        action_delete.triggered.connect(lambda: self._delete_version(version_id))
+            # 如果表中还有其它版本，提供与上一版本的对比
+            all_ids = []
+            for r in range(self.version_table.rowCount()):
+                all_ids.append(int(self.version_table.item(r, 0).text()))
+            all_ids.sort(reverse=True)
+            prev_vid = None
+            for a in all_ids:
+                if a < vid:
+                    prev_vid = a
+                    break
+            if prev_vid is not None:
+                action_diff = QAction(f"对比 v{vid} 与 v{prev_vid}", self)
+                action_diff.triggered.connect(
+                    lambda _a=None, o=prev_vid, n=vid: self._diff_versions(o, n))
+                menu.addAction(action_diff)
+
+            menu.addSeparator()
+
+        else:
+            # 多选状态
+            action_batch_del = QAction(f"批量删除 {len(version_ids)} 个版本", self)
+            action_batch_del.triggered.connect(
+                lambda _a=None, ids=version_ids: self._batch_delete_versions(ids))
+            action_batch_del.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+            menu.addAction(action_batch_del)
+            menu.addSeparator()
+
+        action_delete = QAction("删除版本（当前选中）" if len(version_ids) > 1 else "删除版本", self)
+        action_delete.triggered.connect(lambda _a=None: self._delete_version(primary_vid))
         menu.addAction(action_delete)
 
         menu.exec_(self.version_table.viewport().mapToGlobal(pos))
@@ -1945,6 +2341,124 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"版本 v{version_id} 已删除")
         QMessageBox.information(self, "删除成功", f"版本 v{version_id} 已永久删除。\n已清理关联的本地备份文件。")
         self._refresh_versions()
+
+    # ------------------------------------------------------------------
+    # 批量删除
+    # ------------------------------------------------------------------
+    def _batch_delete_versions(self, version_ids: list):
+        reply = QMessageBox.question(
+            self, "确认批量删除",
+            f"确定要永久删除 {len(version_ids)} 个版本吗？\n\n"
+            f"版本: v{', v'.join(str(v) for v in version_ids)}\n\n此操作不可撤销！",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.status_bar.showMessage(f"正在批量删除 {len(version_ids)} 个版本...")
+
+        sv_url = self.server_url
+
+        class BatchDelWorker(QThread):
+            progress = pyqtSignal(int, int)
+            done = pyqtSignal(int)
+            error = pyqtSignal(str)
+
+            def run(self):
+                for i, vid in enumerate(version_ids):
+                    try:
+                        resp = requests.post(
+                            f"{sv_url}/api/delete_version/{vid}",
+                            timeout=HTTP_TIMEOUT,
+                        )
+                        resp.raise_for_status()
+                    except Exception:
+                        pass
+                    self.progress.emit(i + 1, len(version_ids))
+                self.done.emit(len(version_ids))
+
+        self.batch_del_worker = BatchDelWorker()
+        self.batch_del_worker.progress.connect(
+            lambda c, t: self.status_bar.showMessage(f"批量删除: {c}/{t}")
+        )
+        self.batch_del_worker.done.connect(lambda n: self._on_batch_delete_done(n))
+        self.batch_del_worker.start()
+
+    def _on_batch_delete_done(self, count: int):
+        self.status_bar.showMessage(f"已删除 {count} 个版本")
+        QMessageBox.information(self, "批量删除完成", f"已成功删除 {count} 个版本。")
+        self._refresh_versions()
+
+    # ------------------------------------------------------------------
+    # 版本差异对比
+    # ------------------------------------------------------------------
+    def _diff_versions(self, older_vid: int, newer_vid: int):
+        self.status_bar.showMessage(f"正在获取 v{older_vid} 和 v{newer_vid} 的文件列表...")
+        sv_url = self.server_url
+
+        class DiffFetchWorker(QThread):
+            result = pyqtSignal(list, list)
+            error = pyqtSignal(str)
+
+            def run(self):
+                try:
+                    resp1 = requests.get(
+                        f"{sv_url}/api/version_files/{older_vid}", timeout=HTTP_TIMEOUT)
+                    resp2 = requests.get(
+                        f"{sv_url}/api/version_files/{newer_vid}", timeout=HTTP_TIMEOUT)
+                    resp1.raise_for_status()
+                    resp2.raise_for_status()
+                    f1 = resp1.json().get("files", [])
+                    f2 = resp2.json().get("files", [])
+                    self.result.emit(f1, f2)
+                except Exception as e:
+                    self.error.emit(str(e))
+
+        self.diff_worker = DiffFetchWorker()
+        self.diff_worker.result.connect(
+            lambda f1, f2: self._show_diff_dialog(older_vid, newer_vid, f1, f2)
+        )
+        self.diff_worker.error.connect(lambda e: QMessageBox.critical(self, "获取失败", e))
+        self.diff_worker.start()
+
+    def _show_diff_dialog(self, older_vid: int, newer_vid: int, files_old: list, files_new: list):
+        old_map = {f["path"]: f["md5"] for f in files_old}
+        new_map = {f["path"]: f["md5"] for f in files_new}
+
+        added = [p for p in new_map if p not in old_map]
+        removed = [p for p in old_map if p not in new_map]
+        modified = [p for p in old_map if p in new_map and old_map[p] != new_map[p]]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"版本差异对比 v{older_vid} → v{newer_vid}")
+        dlg.resize(600, 450)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(
+            f"<b>差异摘要</b> — 新增: {len(added)}  删除: {len(removed)}  修改: {len(modified)}"))
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["文件路径", "状态"])
+        tree.setAlternatingRowColors(True)
+
+        for p in added:
+            item = QTreeWidgetItem(tree, [p, "新增"])
+            item.setForeground(1, QBrush(QColor("green")))
+        for p in removed:
+            item = QTreeWidgetItem(tree, [p, "删除"])
+            item.setForeground(1, QBrush(QColor("red")))
+        for p in modified:
+            item = QTreeWidgetItem(tree, [p, "修改"])
+            item.setForeground(1, QBrush(QColor("orange")))
+
+        layout.addWidget(tree, 1)
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec_()
 
 
 # ---------------------------------------------------------------------------

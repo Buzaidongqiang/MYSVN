@@ -86,9 +86,17 @@ def ensure_dirs():
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    """获取数据库连接，自动创建目录并启用 WAL 模式"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        raise RuntimeError(f"无法连接数据库 {DB_PATH}: {e}") from e
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass  # WAL 模式不是必须的，失败不影响基本功能
     return conn
 
 
@@ -195,6 +203,7 @@ def check_files():
         latest_id = get_latest_version_id(db, project_name)
 
         if latest_id == 0:
+            db.close()
             return jsonify({"need_upload": list(client_manifest.keys()), "latest_version": 0})
 
         server_manifest = get_file_manifest(latest_id, db)
@@ -462,29 +471,101 @@ def delete_version(version_id: int):
     """删除指定版本的文件和数据库记录"""
     try:
         db = get_db()
-
         row = db.execute("SELECT id FROM versions WHERE id = ?", (version_id,)).fetchone()
         if not row:
             db.close()
             return jsonify({"error": f"版本 {version_id} 不存在"}), 404
-
         db.execute("DELETE FROM file_records WHERE version_id = ?", (version_id,))
         db.execute("DELETE FROM versions WHERE id = ?", (version_id,))
         db.commit()
         db.close()
-
         files_dir = version_files_dir(version_id)
         if files_dir.exists():
             shutil.rmtree(str(files_dir), ignore_errors=True)
-
         manifest_path = MANIFEST_DIR / f"v{version_id}.json"
         if manifest_path.exists():
             manifest_path.unlink(missing_ok=True)
-
         log.info(f"版本 {version_id} 已删除")
         return jsonify({"success": True, "deleted_version": version_id})
     except Exception as e:
         log.exception("delete_version出错")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/delete_project/<project_name>", methods=["POST"])
+def delete_project(project_name: str):
+    """删除整个工程的所有版本和数据"""
+    try:
+        db = get_db()
+        # 获取该工程的所有版本ID
+        version_ids = db.execute(
+            "SELECT id FROM versions WHERE project_name = ?", (project_name,)
+        ).fetchall()
+        ids = [r["id"] for r in version_ids]
+        if not ids:
+            db.close()
+            return jsonify({"error": f"工程 {project_name} 不存在"}), 404
+
+        # 删除文件记录
+        for vid in ids:
+            db.execute("DELETE FROM file_records WHERE version_id = ?", (vid,))
+        # 删除版本记录
+        db.execute("DELETE FROM versions WHERE project_name = ?", (project_name,))
+        db.commit()
+        db.close()
+
+        # 删除所有版本文件目录和 manifest
+        for vid in ids:
+            files_dir = version_files_dir(vid)
+            if files_dir.exists():
+                shutil.rmtree(str(files_dir), ignore_errors=True)
+            mp = MANIFEST_DIR / f"v{vid}.json"
+            if mp.exists():
+                mp.unlink(missing_ok=True)
+
+        log.info(f"工程 {project_name} 已删除（含 {len(ids)} 个版本）")
+        return jsonify({"success": True, "project_name": project_name, "deleted_versions": len(ids)})
+    except Exception as e:
+        log.exception("delete_project出错")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rename_project", methods=["POST"])
+def rename_project():
+    """重命名工程"""
+    try:
+        data: dict = request.get_json(force=True)
+        old_name = data.get("old_name", "")
+        new_name = data.get("new_name", "")
+        if not old_name or not new_name:
+            return jsonify({"error": "参数不完整"}), 400
+        if old_name == new_name:
+            return jsonify({"success": True})
+
+        db = get_db()
+        # 检查新名称是否已存在
+        exists = db.execute(
+            "SELECT COUNT(*) FROM versions WHERE project_name = ?", (new_name,)
+        ).fetchone()[0]
+        if exists:
+            db.close()
+            return jsonify({"error": f"工程名 '{new_name}' 已存在"}), 409
+
+        # 更新所有版本记录
+        cursor = db.execute(
+            "UPDATE versions SET project_name = ? WHERE project_name = ?",
+            (new_name, old_name),
+        )
+        if cursor.rowcount == 0:
+            db.close()
+            return jsonify({"error": f"工程 '{old_name}' 不存在"}), 404
+
+        db.commit()
+        db.close()
+        log.info(f"工程 {old_name} 已重命名为 {new_name}")
+        return jsonify({"success": True, "old_name": old_name, "new_name": new_name})
+    except Exception as e:
+        log.exception("rename_project出错")
         return jsonify({"error": str(e)}), 500
 
 
