@@ -1,0 +1,24 @@
+# 服务端运行时数据
+repo/
+mysvn.db
+
+# 打包产物
+*.exe
+*.spec
+dist/
+build/
+__pycache__/
+*.pyc
+
+# 备份文件
+*_backup_*/
+*_backup_*.zip
+
+# 客户端本地状态
+.mysvn_manifest.json
+crash.log
+
+# Python
+*.pyo
+*.egg-info/
+.eggs/
