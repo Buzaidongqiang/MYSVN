@@ -18,6 +18,7 @@ try:
     import hashlib
     import socket
     import shutil
+    import subprocess
     import zipfile
     import io
     import time
@@ -431,6 +432,134 @@ class FetchProjectsWorker(QThread):
             self.error.emit(str(e))
 
 
+class AiRemarkWorker(QThread):
+    """后台调用 DeepSeek API 生成提交备注"""
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, file_list: list, api_key: str, model: str = "deepseek-chat"):
+        super().__init__()
+        self.file_list = file_list
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        try:
+            if not self.api_key:
+                self.error.emit("未配置 DeepSeek API Key，请在设置中配置")
+                return
+            if not self.file_list:
+                self.error.emit("文件列表为空")
+                return
+            msg = generate_ai_message(self.file_list, self.api_key, self.model)
+            if msg:
+                self.finished.emit(msg)
+            else:
+                self.error.emit("AI 返回为空，请检查 API Key 和网络连接")
+        except Exception as e:
+            self.error.emit(f"AI 调用出错: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 版本信息
+# ---------------------------------------------------------------------------
+APP_VERSION = "1.0.2"  # 仅用于显示，更新检测基于 git commit 对比
+# 本地 git 仓库路径（用于获取本地 HEAD）
+GIT_REPO_PATH = os.path.dirname(os.path.abspath(__file__))
+# 远程仓库 commits API（将 main 改为你的默认分支名）
+GITHUB_COMMITS_API = "https://api.github.com/repos/Buzaidongqiang/MYSVN/commits/main"
+
+def _get_local_head_sha() -> str:
+    """获取本地 git HEAD 的 SHA"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=GIT_REPO_PATH,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+class UpdateCheckWorker(QThread):
+    """后台检查 GitHub 仓库是否有新提交（多源回退）"""
+    finished = pyqtSignal(dict)  # {has_update, local_sha, remote_sha, commit_msg, source}
+    error = pyqtSignal(str)
+
+    def _try_api(self, local_sha: str):
+        """方式 1：GitHub REST API（能获取 commit 摘要）"""
+        resp = requests.get(GITHUB_COMMITS_API, timeout=10)
+        if resp.status_code == 404:
+            return None  # 仓库或分支不存在，交给 git fallback
+        resp.raise_for_status()
+        data = resp.json()
+        remote_sha = data.get("sha", "")
+        commit_msg = data.get("commit", {}).get("message", "")
+        if not remote_sha:
+            return None
+        return {
+            "has_update": remote_sha != local_sha,
+            "local_sha": local_sha[:10],
+            "remote_sha": remote_sha[:10],
+            "commit_msg": commit_msg.split("\n")[0] if commit_msg else "",
+            "source": "GitHub API",
+        }
+
+    def _try_git(self, local_sha: str):
+        """方式 2：git ls-remote（走 git 网络栈，支持镜像/代理）"""
+        result = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/main"],
+            cwd=GIT_REPO_PATH,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return None
+        # git ls-remote 输出格式: <sha>\trefs/heads/main
+        remote_sha = output.split()[0]
+        return {
+            "has_update": remote_sha != local_sha,
+            "local_sha": local_sha[:10],
+            "remote_sha": remote_sha[:10],
+            "commit_msg": "(请执行 git fetch 查看详情)",
+            "source": "git ls-remote",
+        }
+
+    def run(self):
+        try:
+            local_sha = _get_local_head_sha()
+            if not local_sha:
+                self.error.emit("无法获取本地版本信息，请确保 git 已安装")
+                return
+
+            # 优先用 GitHub API（能获取 commit 摘要）
+            try:
+                result = self._try_api(local_sha)
+                if result is not None:
+                    self.finished.emit(result)
+                    return
+            except requests.ConnectionError:
+                pass  # API 不可用，回退到 git
+            except Exception:
+                pass
+
+            # 回退到 git ls-remote
+            result = self._try_git(local_sha)
+            if result is not None:
+                self.finished.emit(result)
+                return
+
+            self.error.emit("所有更新源均不可用，请检查网络或手动访问 GitHub")
+        except Exception as e:
+            self.error.emit(f"检查更新失败: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -572,33 +701,34 @@ def _guess_ext_category(rel_path: str) -> str:
 
 
 class CommitFileDialog(QDialog):
-    """提交文件勾选对话框"""
+    """提交文件勾选对话框 — 目录树结构，内置 AI 备注"""
     def __init__(self, file_sizes: dict, need_upload: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("选择要提交的文件")
-        self.resize(700, 500)
+        self.resize(720, 540)
 
         self.file_sizes = file_sizes
         self.need_upload = need_upload
-        self.checks = {}
+        self.checks = {}           # {file_path: bool}
+        self._folder_items = {}    # {folder_path: QTreeWidgetItem}
         self.message = ""
         self.confirmed = False
         self.selected_files = []
 
         self._init_ui()
-        self._populate_files()
+        self._populate_tree()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        layout.addWidget(QLabel("<b>变更文件列表 — 勾选需要提交的文件：</b>"))
+        layout.addWidget(QLabel("<b>变更文件 — 按目录勾选：</b>"))
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["文件路径", "大小", "类型"])
-        self.tree.setRootIsDecorated(True)
+        self.tree.setHeaderLabels(["路径/文件", "大小", "类型"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QTreeWidget.NoSelection)
+        self.tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tree, 1)
 
         btn_row = QHBoxLayout()
@@ -613,10 +743,16 @@ class CommitFileDialog(QDialog):
         btn_row.addWidget(self.info_label)
         layout.addLayout(btn_row)
 
-        layout.addWidget(QLabel("版本备注:"))
+        # 版本备注 + AI 按钮
+        msg_row = QHBoxLayout()
+        msg_row.addWidget(QLabel("版本备注:"))
         self.msg_edit = QLineEdit()
         self.msg_edit.setPlaceholderText("输入本次提交的备注信息...")
-        layout.addWidget(self.msg_edit)
+        msg_row.addWidget(self.msg_edit, 1)
+        self.ai_btn = QPushButton("\U0001f916 AI 生成")
+        self.ai_btn.clicked.connect(self._ai_generate)
+        msg_row.addWidget(self.ai_btn)
+        layout.addLayout(msg_row)
 
         btn_layout = QHBoxLayout()
         cancel_btn = QPushButton("取消")
@@ -629,61 +765,71 @@ class CommitFileDialog(QDialog):
         btn_layout.addWidget(ok_btn)
         layout.addLayout(btn_layout)
 
-    def _populate_files(self):
-        groups = {}
-        for rel in self.need_upload:
-            cat = _guess_ext_category(rel)
-            if cat not in groups:
-                groups[cat] = []
-            groups[cat].append(rel)
+    def _populate_tree(self):
+        sorted_files = sorted(self.need_upload, key=lambda x: (x.split("/")[:-1], x))
 
-        for cat in sorted(groups.keys()):
-            cat_item = QTreeWidgetItem(self.tree, [cat, "", f"{len(groups[cat])} 个文件"])
-            cat_item.setFlags(cat_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            cat_item.setCheckState(0, Qt.Checked)
-            cat_item.setExpanded(True)
+        for rel_path in sorted_files:
+            parts = rel_path.split("/")
+            sz = self.file_sizes.get(rel_path, 0)
+            self.checks[rel_path] = True
 
-            for fpath in groups[cat]:
-                sz = self.file_sizes.get(fpath, 0)
-                ch = QCheckBox()
-                ch.setChecked(True)
-                ch.stateChanged.connect(lambda s, p=fpath: self._on_check_changed(p, s == Qt.Checked))
+            parent_item = None
+            folder_path = ""
+            for i, part in enumerate(parts[:-1]):
+                folder_path = folder_path + "/" + part if folder_path else part
+                if folder_path not in self._folder_items:
+                    item = QTreeWidgetItem()
+                    item.setText(0, part)
+                    item.setText(1, "")
+                    item.setText(2, "文件夹")
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsAutoTristate)
+                    item.setCheckState(0, Qt.Checked)
+                    item.setExpanded(True)
+                    if parent_item is None:
+                        self.tree.addTopLevelItem(item)
+                    else:
+                        parent_item.addChild(item)
+                    self._folder_items[folder_path] = item
+                parent_item = self._folder_items[folder_path]
 
-                item = QTreeWidgetItem(cat_item, [
-                    fpath,
-                    _format_size(sz),
-                    _guess_ext_category(fpath)
-                ])
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                item.setCheckState(0, Qt.Checked)
+            file_name = parts[-1]
+            file_item = QTreeWidgetItem()
+            file_item.setText(0, file_name)
+            file_item.setText(1, _format_size(sz))
+            file_item.setText(2, _guess_ext_category(rel_path))
+            file_item.setFlags(file_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            file_item.setCheckState(0, Qt.Checked)
+            file_item.setData(0, Qt.UserRole, rel_path)
 
-                container = QWidget()
-                container_layout = QHBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.addWidget(ch)
-                self.tree.setItemWidget(item, 0, container)
-                self.checks[fpath] = True
+            if parent_item is not None:
+                parent_item.addChild(file_item)
+            else:
+                self.tree.addTopLevelItem(file_item)
 
         self._update_info()
+
+    def _on_item_changed(self, item, column):
+        if column != 0:
+            return
+        is_checked = item.checkState(0) == Qt.Checked
+        self._apply_check_state(item, is_checked)
+
+    def _apply_check_state(self, item, checked: bool):
+        rel_path = item.data(0, Qt.UserRole)
+        if rel_path and rel_path in self.checks:
+            self.checks[rel_path] = checked
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+            self._apply_check_state(child, checked)
 
     def _toggle_all(self, checked: bool):
-        for fpath in list(self.checks.keys()):
-            self.checks[fpath] = checked
+        self.tree.blockSignals(True)
         for i in range(self.tree.topLevelItemCount()):
-            cat_item = self.tree.topLevelItem(i)
-            cat_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-            for j in range(cat_item.childCount()):
-                child = cat_item.child(j)
-                child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-                widget = self.tree.itemWidget(child, 0)
-                if widget:
-                    cb = widget.findChild(QCheckBox)
-                    if cb:
-                        cb.setChecked(checked)
-        self._update_info()
-
-    def _on_check_changed(self, fpath: str, checked: bool):
-        self.checks[fpath] = checked
+            item = self.tree.topLevelItem(i)
+            item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+            self._apply_check_state(item, checked)
+        self.tree.blockSignals(False)
         self._update_info()
 
     def _update_info(self):
@@ -692,6 +838,43 @@ class CommitFileDialog(QDialog):
             self.file_sizes.get(f, 0) for f, v in self.checks.items() if v
         )
         self.info_label.setText(f"已选: {selected}/{len(self.need_upload)} 个文件, {_format_size(total_size)}")
+
+    def _ai_generate(self):
+        """根据当前勾选的文件调用 AI 生成备注"""
+        checked_files = [f for f, v in self.checks.items() if v]
+        if not checked_files:
+            QMessageBox.warning(self, "提示", "请先勾选需要提交的文件")
+            return
+
+        parent = self.parent()
+        if not parent:
+            QMessageBox.warning(self, "提示", "无法获取设置")
+            return
+
+        api_key = parent.settings.value("deepseek_api_key", "")
+        if not api_key:
+            QMessageBox.information(self, "提示", "未配置 DeepSeek API Key。\n请在主菜单「设置」中配置。")
+            return
+
+        model = parent.settings.value("deepseek_model", "deepseek-chat")
+
+        self.ai_btn.setEnabled(False)
+        self.ai_btn.setText("生成中...")
+
+        self.ai_worker = AiRemarkWorker(checked_files, api_key, model)
+        self.ai_worker.finished.connect(self._on_ai_done)
+        self.ai_worker.error.connect(self._on_ai_error)
+        self.ai_worker.start()
+
+    def _on_ai_done(self, text: str):
+        self.msg_edit.setText(text)
+        self.ai_btn.setEnabled(True)
+        self.ai_btn.setText("\U0001f916 AI 生成")
+
+    def _on_ai_error(self, err: str):
+        QMessageBox.warning(self, "AI 生成失败", err)
+        self.ai_btn.setEnabled(True)
+        self.ai_btn.setText("\U0001f916 AI 生成")
 
     def _confirm(self):
         self.selected_files = [f for f, v in self.checks.items() if v]
@@ -723,6 +906,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._restore_settings()
+        self.setAcceptDrops(True)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -735,7 +919,9 @@ class MainWindow(QMainWindow):
 
         # ---- 菜单栏 ----
         menubar = self.menuBar()
-        menubar.addAction("\u2699 设置").triggered.connect(self._open_settings)
+        help_menu = menubar.addMenu("帮助")
+        help_menu.addAction("\u2699 设置").triggered.connect(self._open_settings)
+        help_menu.addAction(f"\U0001f4e1 检查更新 (v{APP_VERSION})").triggered.connect(self._check_update)
 
         # ---- 服务器连接区 ----
         conn_group = QGroupBox("服务器连接")
@@ -807,6 +993,9 @@ class MainWindow(QMainWindow):
         self.select_folder_btn = QPushButton("浏览文件夹...")
         self.select_folder_btn.clicked.connect(self._browse_folder)
         info_layout.addWidget(self.select_folder_btn)
+        self.drop_hint = QLabel("\U0001f4c2 或拖放文件夹到窗口")
+        self.drop_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 6px; border: 1px dashed #ccc; border-radius: 3px;")
+        info_layout.addWidget(self.drop_hint)
         main_layout.addLayout(info_layout)
 
         # ---- 版本列表 ----
@@ -841,11 +1030,6 @@ class MainWindow(QMainWindow):
         self.commit_btn.clicked.connect(self._commit)
         action_layout.addWidget(self.commit_btn)
 
-        self.ai_btn = QPushButton("\U0001f916 AI 备注")
-        self.ai_btn.setMinimumHeight(36)
-        self.ai_btn.clicked.connect(self._ai_generate_message)
-        action_layout.addWidget(self.ai_btn)
-
         self.rollback_btn = QPushButton("\U0001f4e4 还原选中版本")
         self.rollback_btn.setMinimumHeight(36)
         self.rollback_btn.clicked.connect(self._rollback)
@@ -869,7 +1053,6 @@ class MainWindow(QMainWindow):
         has_folder = bool(self.local_folder)
         has_project = bool(self.project_name)
         self.commit_btn.setEnabled(connected and has_folder and has_project)
-        self.ai_btn.setEnabled(connected and has_folder and has_project)
         self.rollback_btn.setEnabled(connected and has_folder and has_project)
         self.refresh_btn.setEnabled(connected and has_project)
         self.refresh_proj_btn.setEnabled(connected)
@@ -965,6 +1148,43 @@ class MainWindow(QMainWindow):
                 "你也可以手动输入服务器地址。"
             )
 
+    # ------------------------------------------------------------------
+    # 拖放支持
+    # ------------------------------------------------------------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            # 视觉反馈：边框发光效果
+            self.setStyleSheet("QMainWindow { border: 3px solid #4CAF50; }")
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet("")
+
+    def dropEvent(self, event):
+        self.setStyleSheet("")
+        urls = event.mimeData().urls()
+        if urls:
+            folder = urls[0].toLocalFile()
+            if os.path.isdir(folder):
+                self._on_folder_dropped(folder)
+
+    def _on_folder_dropped(self, folder: str):
+        self.local_folder = folder
+        self.project_name = os.path.basename(folder)
+        self.folder_info.setText(folder)
+        self.project_info.setText(f"\U0001f4c1 {self.project_name}")
+        # 更新注册表
+        self.projects_registry[self.project_name] = {
+            "local_path": folder,
+            "local_version": 0,
+            "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._save_settings()
+        self._update_button_states()
+        self._refresh_versions()
+        self._refresh_projects()
+        self.status_bar.showMessage(f"已拖入工程: {self.project_name}")
+
     def _connect_server(self):
         addr = self.addr_edit.text().strip()
         if not addr:
@@ -1038,6 +1258,24 @@ class MainWindow(QMainWindow):
                 status = "未部署"
             self.proj_table.setItem(i, 4, QTableWidgetItem(status))
         self.status_bar.showMessage(f"共 {len(projects)} 个项目")
+
+        # 自动恢复上次使用的工程
+        if not self.local_folder:
+            for name, reg in self.projects_registry.items():
+                lp = reg.get("local_path", "")
+                if lp and os.path.isdir(lp):
+                    # 检查服务端有没有同名工程
+                    matched = [p for p in projects if p["name"] == name]
+                    if matched:
+                        self.local_folder = lp
+                        self.project_name = name
+                        self.current_version = reg.get("local_version", 0)
+                        self.folder_info.setText(lp)
+                        self.project_info.setText(f"\U0001f4c1 {name}")
+                        self._update_button_states()
+                        self._refresh_versions()
+                        self.status_bar.showMessage(f"已恢复工程: {name}")
+                        break
 
     def _on_projects_error(self, msg: str):
         self.status_bar.showMessage(f"获取项目列表失败: {msg}")
@@ -1356,102 +1594,92 @@ class MainWindow(QMainWindow):
         return 0, {}
 
     # ------------------------------------------------------------------
-    # AI 备注
+    # 检查更新（基于 Git commit 对比）
     # ------------------------------------------------------------------
-    def _ai_generate_message(self):
-        api_key = self.settings.value("deepseek_api_key", "")
-        if not api_key:
-            QMessageBox.information(
-                self, "提示",
-                "未配置 DeepSeek API Key。\n请在菜单栏「设置」中配置。"
-            )
+    def _check_update(self):
+        self.status_bar.showMessage("正在检查更新...")
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.finished.connect(self._on_update_result)
+        self.update_worker.error.connect(self._on_update_error)
+        self.update_worker.start()
+
+    def _on_update_result(self, info: dict):
+        source = info.get("source", "")
+        if not info.get("has_update"):
+            QMessageBox.information(self, "检查更新",
+                f"当前已是最新版本\n本地: {info.get('local_sha', '')}\n来源: {source}")
+            self.status_bar.showMessage("已是最新版本")
             return
 
-        if not self.local_folder:
-            QMessageBox.warning(self, "提示", "请先选择本地工程文件夹")
-            return
+        local_sha = info.get("local_sha", "?")
+        remote_sha = info.get("remote_sha", "?")
+        commit_msg = info.get("commit_msg", "")
 
-        self.status_bar.showMessage("正在扫描文件用于 AI 分析...")
-        self.ai_scan_worker = ScanWorker(self.local_folder)
-        self.ai_scan_worker.finished_scan.connect(self._on_ai_scan_done)
-        self.ai_scan_worker.error.connect(self._on_scan_error)
-        self.ai_scan_worker.start()
+        msg = (
+            f"发现新提交！\n\n"
+            f"本地版本: {local_sha}\n"
+            f"远程最新: {remote_sha}\n"
+            f"最新提交: {commit_msg}\n\n"
+            "是否立即执行 git pull 更新？"
+        )
+        result = QMessageBox.question(
+            self, "发现更新", msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if result == QMessageBox.Yes:
+            self._do_git_pull()
 
-    def _on_ai_scan_done(self, manifest: dict, file_sizes: dict):
-        changed_files = list(manifest.keys())
-        api_key = self.settings.value("deepseek_api_key", "")
-        model = self.settings.value("deepseek_model", "deepseek-chat")
+    def _do_git_pull(self):
+        """后台执行 git pull 一键更新"""
+        self.status_bar.showMessage("正在 git pull...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(0)
 
-        self.status_bar.showMessage("正在调用 AI 生成备注...")
-
-        class AiWorker(QThread):
-            result_ready = pyqtSignal(str)
-
-            def run(self):
-                msg = generate_ai_message(changed_files, api_key, model)
-                self.result_ready.emit(msg or "")
-
-        self._pending_manifest = manifest
-        self._pending_file_sizes = file_sizes
-
-        self.ai_worker = AiWorker()
-        self.ai_worker.result_ready.connect(self._on_ai_result)
-        self.ai_worker.start()
-
-    def _on_ai_result(self, text: str):
-        self.status_bar.showMessage("AI 备注生成完成")
-        if text:
-            self._commit_with_ai_message(text.strip())
-
-    def _commit_with_ai_message(self, message: str):
-        manifest = self._pending_manifest
-        file_sizes = self._pending_file_sizes
-        server_url = self.server_url
-        current_version = self.current_version
-        project_name = self.project_name
-
-        class CheckWorker(QThread):
-            result = pyqtSignal(dict)
+        class GitPullWorker(QThread):
+            done = pyqtSignal(bool, str)
 
             def run(self):
                 try:
-                    resp = requests.post(
-                        f"{server_url}/api/check_files",
-                        json={"manifest": manifest, "base_version": current_version, "project_name": project_name},
-                        timeout=HTTP_TIMEOUT,
+                    result = subprocess.run(
+                        ["git", "pull", "origin", "main"],
+                        cwd=GIT_REPO_PATH,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
                     )
-                    resp.raise_for_status()
-                    self.result.emit(resp.json())
+                    success = result.returncode == 0
+                    output = result.stdout.strip() or result.stderr.strip()
+                    if not output:
+                        output = "Already up to date." if success else "更新失败"
+                    self.done.emit(success, output)
+                except subprocess.TimeoutExpired:
+                    self.done.emit(False, "git pull 超时，请手动执行")
+                except FileNotFoundError:
+                    self.done.emit(False, "未找到 git 命令，请确保 Git 已安装")
                 except Exception as e:
-                    self.result.emit({"error": str(e)})
+                    self.done.emit(False, str(e))
 
-        check_worker = CheckWorker()
-        check_worker.result.connect(lambda r: self._on_ai_check_result(r, manifest, file_sizes, message))
-        check_worker.start()
+        self.git_worker = GitPullWorker()
+        self.git_worker.done.connect(self._on_git_pull_done)
+        self.git_worker.start()
 
-    def _on_ai_check_result(self, result: dict, manifest: dict, file_sizes: dict, message: str):
-        if result.get("error"):
-            QMessageBox.critical(self, "错误", str(result["error"]))
-            self.status_bar.showMessage("对比失败")
-            return
+    def _on_git_pull_done(self, success: bool, output: str):
+        self.progress_bar.setVisible(False)
+        if success:
+            QMessageBox.information(self, "更新完成",
+                f"代码已更新到最新版本。\n\n{output}\n\n请重启客户端以加载新代码。")
+            self.status_bar.showMessage("更新完成，请重启客户端")
+        else:
+            QMessageBox.critical(self, "更新失败",
+                f"git pull 执行失败：\n\n{output}\n\n请手动在命令行执行 git pull。")
+            self.status_bar.showMessage("更新失败")
 
-        conflicts = result.get("conflicts", [])
-        if conflicts:
-            file_list = "\n".join(f"  - {f}" for f in conflicts[:20])
-            self.status_bar.showMessage("检测到冲突")
-            QMessageBox.critical(self, "冲突检测",
-                f"以下文件已被其他用户修改，请先还原到最新版本再修改：\n{file_list}")
-            return
-
-        need_upload = result.get("need_upload", [])
-        if not need_upload:
-            QMessageBox.information(self, "提示", "没有检测到任何变更")
-            return
-
-        dlg = CommitFileDialog(file_sizes, need_upload, self)
-        dlg.msg_edit.setText(message)
-        if dlg.exec_() == QDialog.Accepted and dlg.confirmed:
-            self._do_upload(manifest, dlg.message, dlg.selected_files)
+    def _on_update_error(self, err: str):
+        self.status_bar.showMessage("检查更新失败")
+        QMessageBox.warning(self, "检查更新失败",
+            f"无法检查更新：{err}\n\n"
+            "请稍后重试，或手动访问 GitHub 仓库查看最新版本。")
 
     # ------------------------------------------------------------------
     # 还原版本

@@ -16,6 +16,7 @@ __pycache__/
 
 # 客户端本地状态
 .mysvn_manifest.json
+.mysvn_projects.json
 crash.log
 
 # Python
