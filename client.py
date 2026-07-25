@@ -404,6 +404,35 @@ class FetchVersionsWorker(QThread):
             self.error.emit(str(e))
 
 
+class FetchProjectsWorker(QThread):
+    """后台获取服务端项目列表"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, server_url: str):
+        super().__init__()
+        self.server_url = server_url.rstrip("/")
+
+    def run(self):
+        try:
+            resp = requests.get(
+                f"{self.server_url}/api/projects",
+                timeout=HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("error"):
+                self.error.emit(data["error"])
+            else:
+                self.finished.emit(data.get("projects", []))
+        except requests.ConnectionError:
+            self.error.emit("无法连接到服务器")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+
+
 # ---------------------------------------------------------------------------
 # AI 备注生成
 # ---------------------------------------------------------------------------
@@ -689,6 +718,8 @@ class MainWindow(QMainWindow):
         self.username = os.getenv("USERNAME") or os.getenv("USER") or "anonymous"
         self.current_version = 0
         self.settings = QSettings("MySVN", "Client")
+        self.projects_registry = {}   # {project_name: {local_path, local_version, ...}}
+        self.server_projects = []     # 服务端项目列表 [{name, latest_version, ...}]
 
         self._init_ui()
         self._restore_settings()
@@ -700,12 +731,11 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(8)
+        main_layout.setSpacing(6)
 
         # ---- 菜单栏 ----
         menubar = self.menuBar()
-        settings_action = menubar.addAction("\u2699 设置")
-        settings_action.triggered.connect(self._open_settings)
+        menubar.addAction("\u2699 设置").triggered.connect(self._open_settings)
 
         # ---- 服务器连接区 ----
         conn_group = QGroupBox("服务器连接")
@@ -716,7 +746,7 @@ class MainWindow(QMainWindow):
         self.addr_edit.setPlaceholderText("192.168.1.x:5000")
         conn_layout.addWidget(self.addr_edit, 1)
 
-        self.discover_btn = QPushButton("\U0001f50d 自动搜索服务器")
+        self.discover_btn = QPushButton("\U0001f50d 自动搜索")
         self.discover_btn.clicked.connect(self._discover_server)
         conn_layout.addWidget(self.discover_btn)
 
@@ -730,21 +760,54 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(conn_group)
 
-        # ---- 本地文件夹区 ----
-        folder_group = QGroupBox("本地工程")
-        folder_layout = QHBoxLayout(folder_group)
+        # ---- 服务端工程列表 ----
+        proj_group = QGroupBox("服务端工程")
+        proj_layout = QVBoxLayout(proj_group)
+        proj_layout.setSpacing(4)
 
-        folder_layout.addWidget(QLabel("文件夹:"))
-        self.folder_edit = QLineEdit()
-        self.folder_edit.setReadOnly(True)
-        self.folder_edit.setPlaceholderText("选择本地工程文件夹...")
-        folder_layout.addWidget(self.folder_edit, 1)
+        self.proj_table = QTableWidget()
+        self.proj_table.setColumnCount(5)
+        self.proj_table.setHorizontalHeaderLabels(["工程名", "最新版本", "文件数", "最后提交", "本地状态"])
+        self.proj_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.proj_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.proj_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.proj_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.proj_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.proj_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.proj_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.proj_table.setAlternatingRowColors(True)
+        self.proj_table.setMinimumHeight(100)
+        self.proj_table.setMaximumHeight(200)
+        self.proj_table.itemSelectionChanged.connect(self._on_project_selected)
+        proj_layout.addWidget(self.proj_table)
 
-        self.browse_btn = QPushButton("浏览...")
-        self.browse_btn.clicked.connect(self._browse_folder)
-        folder_layout.addWidget(self.browse_btn)
+        proj_btn_row = QHBoxLayout()
+        self.refresh_proj_btn = QPushButton("\U0001f504 刷新项目列表")
+        self.refresh_proj_btn.clicked.connect(self._refresh_projects)
+        proj_btn_row.addWidget(self.refresh_proj_btn)
 
-        main_layout.addWidget(folder_group)
+        self.deploy_btn = QPushButton("\U0001f4e6 部署到本地")
+        self.deploy_btn.clicked.connect(self._deploy_project)
+        proj_btn_row.addWidget(self.deploy_btn)
+
+        self.sync_btn = QPushButton("\U0001f504 同步到最新")
+        self.sync_btn.clicked.connect(self._sync_to_latest)
+        proj_btn_row.addWidget(self.sync_btn)
+
+        proj_layout.addLayout(proj_btn_row)
+        main_layout.addWidget(proj_group)
+
+        # ---- 当前工程信息 ----
+        info_layout = QHBoxLayout()
+        self.project_info = QLabel("未选择工程")
+        self.project_info.setStyleSheet("font-weight: bold;")
+        info_layout.addWidget(self.project_info)
+        self.folder_info = QLabel("")
+        info_layout.addWidget(self.folder_info, 1)
+        self.select_folder_btn = QPushButton("浏览文件夹...")
+        self.select_folder_btn.clicked.connect(self._browse_folder)
+        info_layout.addWidget(self.select_folder_btn)
+        main_layout.addLayout(info_layout)
 
         # ---- 版本列表 ----
         list_group = QGroupBox("版本历史")
@@ -773,17 +836,17 @@ class MainWindow(QMainWindow):
         # ---- 操作按钮区 ----
         action_layout = QHBoxLayout()
 
-        self.commit_btn = QPushButton("\U0001f4be 保存版本 (Commit)")
+        self.commit_btn = QPushButton("\U0001f4be 保存版本")
         self.commit_btn.setMinimumHeight(36)
         self.commit_btn.clicked.connect(self._commit)
         action_layout.addWidget(self.commit_btn)
 
-        self.ai_btn = QPushButton("\U0001f916 AI 自动生成备注")
+        self.ai_btn = QPushButton("\U0001f916 AI 备注")
         self.ai_btn.setMinimumHeight(36)
         self.ai_btn.clicked.connect(self._ai_generate_message)
         action_layout.addWidget(self.ai_btn)
 
-        self.rollback_btn = QPushButton("\U0001f504 还原选中版本")
+        self.rollback_btn = QPushButton("\U0001f4e4 还原选中版本")
         self.rollback_btn.setMinimumHeight(36)
         self.rollback_btn.clicked.connect(self._rollback)
         action_layout.addWidget(self.rollback_btn)
@@ -804,10 +867,37 @@ class MainWindow(QMainWindow):
     def _update_button_states(self):
         connected = bool(self.server_url)
         has_folder = bool(self.local_folder)
-        self.commit_btn.setEnabled(connected and has_folder)
-        self.ai_btn.setEnabled(connected and has_folder)
-        self.rollback_btn.setEnabled(connected and has_folder)
-        self.refresh_btn.setEnabled(connected)
+        has_project = bool(self.project_name)
+        self.commit_btn.setEnabled(connected and has_folder and has_project)
+        self.ai_btn.setEnabled(connected and has_folder and has_project)
+        self.rollback_btn.setEnabled(connected and has_folder and has_project)
+        self.refresh_btn.setEnabled(connected and has_project)
+        self.refresh_proj_btn.setEnabled(connected)
+        self.deploy_btn.setEnabled(connected)
+        self.sync_btn.setEnabled(connected and has_folder and has_project)
+
+    # ------------------------------------------------------------------
+    # 本地工程注册表
+    # ------------------------------------------------------------------
+    def _reg_path(self) -> Path:
+        return Path(__file__).parent.resolve() / ".mysvn_projects.json"
+
+    def _save_registry(self):
+        try:
+            self._reg_path().write_text(
+                json.dumps({"projects": self.projects_registry}, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _load_registry(self):
+        try:
+            if self._reg_path().exists():
+                data = json.loads(self._reg_path().read_text(encoding="utf-8"))
+                self.projects_registry = data.get("projects", {})
+        except Exception:
+            self.projects_registry = {}
 
     # ------------------------------------------------------------------
     # 设置持久化
@@ -816,15 +906,11 @@ class MainWindow(QMainWindow):
         last_addr = self.settings.value("last_server_address", "")
         if last_addr:
             self.addr_edit.setText(last_addr)
-        last_folder = self.settings.value("last_folder", "")
-        if last_folder and os.path.isdir(last_folder):
-            self.folder_edit.setText(last_folder)
-            self.local_folder = last_folder
-            self.project_name = os.path.basename(last_folder)
+        self._load_registry()
 
     def _save_settings(self):
         self.settings.setValue("last_server_address", self.addr_edit.text().strip())
-        self.settings.setValue("last_folder", self.local_folder)
+        self._save_registry()
 
     # ------------------------------------------------------------------
     # 事件处理
@@ -837,12 +923,19 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "选择本地工程文件夹")
         if folder:
             self.local_folder = folder
+            self.folder_info.setText(folder)
             self.project_name = os.path.basename(folder)
-            self.folder_edit.setText(folder)
+            # 更新注册表
+            self.projects_registry[self.project_name] = {
+                "local_path": folder,
+                "local_version": 0,
+                "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
             self._save_settings()
             self._update_button_states()
             self._refresh_versions()
-            self.status_bar.showMessage(f"已选择: {self.project_name}")
+            self._refresh_projects()
+            self.status_bar.showMessage(f"已选择: {self.project_name}  ({folder})")
 
     def _discover_server(self):
         self.discover_btn.setEnabled(False)
@@ -860,7 +953,7 @@ class MainWindow(QMainWindow):
 
     def _on_discover_finished(self):
         self.discover_btn.setEnabled(True)
-        self.discover_btn.setText("\U0001f50d 自动搜索服务器")
+        self.discover_btn.setText("\U0001f50d 自动搜索")
         if not self.addr_edit.text():
             self.status_bar.showMessage("未发现服务器，请检查服务端是否启动")
             QMessageBox.information(
@@ -884,7 +977,8 @@ class MainWindow(QMainWindow):
         self.conn_status.setStyleSheet("color: green;")
         self._save_settings()
         self._update_button_states()
-        self.status_bar.showMessage(f"已连接到 {addr} — 请选择本地工程文件夹")
+        self.status_bar.showMessage(f"已连接到 {addr}")
+        self._refresh_projects()
 
     def _refresh_versions(self):
         if not self.server_url or not self.project_name:
@@ -908,6 +1002,196 @@ class MainWindow(QMainWindow):
 
     def _on_versions_error(self, msg: str):
         self.status_bar.showMessage(f"获取版本失败: {msg}")
+
+    # ------------------------------------------------------------------
+    # 服务端工程列表
+    # ------------------------------------------------------------------
+    def _refresh_projects(self):
+        if not self.server_url:
+            return
+        self.status_bar.showMessage("正在获取服务端工程列表...")
+        self.proj_worker = FetchProjectsWorker(self.server_url)
+        self.proj_worker.finished.connect(self._on_projects_loaded)
+        self.proj_worker.error.connect(self._on_projects_error)
+        self.proj_worker.start()
+
+    def _on_projects_loaded(self, projects: list):
+        self.server_projects = projects
+        self.proj_table.setRowCount(len(projects))
+        for i, p in enumerate(projects):
+            name = p["name"]
+            self.proj_table.setItem(i, 0, QTableWidgetItem(name))
+            self.proj_table.setItem(i, 1, QTableWidgetItem(f"v{p['latest_version']}"))
+            self.proj_table.setItem(i, 2, QTableWidgetItem(str(p["file_count"])))
+            self.proj_table.setItem(i, 3, QTableWidgetItem(p.get("last_commit_time", "")))
+
+            # 本地状态
+            reg = self.projects_registry.get(name, {})
+            local_path = reg.get("local_path", "")
+            local_ver = reg.get("local_version", 0)
+            if local_path and os.path.isdir(local_path):
+                if local_ver >= p["latest_version"]:
+                    status = f"\u2713 已部署 v{local_ver}"
+                else:
+                    status = f"\u2191 落后 (本地v{local_ver})"
+            else:
+                status = "未部署"
+            self.proj_table.setItem(i, 4, QTableWidgetItem(status))
+        self.status_bar.showMessage(f"共 {len(projects)} 个项目")
+
+    def _on_projects_error(self, msg: str):
+        self.status_bar.showMessage(f"获取项目列表失败: {msg}")
+
+    def _on_project_selected(self):
+        rows = self.proj_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        proj_name = self.proj_table.item(row, 0).text()
+        latest = int(self.proj_table.item(row, 1).text().lstrip("v"))
+
+        # 检查注册表中是否已关联本地文件夹
+        reg = self.projects_registry.get(proj_name, {})
+        local_path = reg.get("local_path", "")
+        if local_path and os.path.isdir(local_path):
+            self.local_folder = local_path
+            self.project_name = proj_name
+            self.current_version = reg.get("local_version", 0)
+            self.folder_info.setText(local_path)
+            self.project_info.setText(f"\U0001f4c1 {proj_name}")
+            self._update_button_states()
+            self._refresh_versions()
+            self.status_bar.showMessage(f"已切换到工程: {proj_name}")
+        else:
+            self.project_info.setText(f"\U0001f4c1 {proj_name} (未部署)")
+            self.folder_info.setText("点击「部署到本地」下载")
+
+    # ------------------------------------------------------------------
+    # 部署到本地
+    # ------------------------------------------------------------------
+    def _deploy_project(self):
+        rows = self.proj_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.warning(self, "提示", "请先在工程列表中选择一个项目")
+            return
+        row = rows[0].row()
+        proj_name = self.proj_table.item(row, 0).text()
+        latest_ver = int(self.proj_table.item(row, 1).text().lstrip("v"))
+
+        folder = QFileDialog.getExistingDirectory(self, f"选择存放 {proj_name} 的文件夹")
+        if not folder:
+            return
+
+        target = Path(folder)
+        if target.exists() and any(target.iterdir()):
+            reply = QMessageBox.question(self, "文件夹不为空",
+                f"文件夹 '{folder}' 不为空，确定要写入吗？\n同名文件将被覆盖。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+        self.local_folder = str(target)
+        self.project_name = proj_name
+        self.folder_info.setText(str(target))
+        self.project_info.setText(f"\U0001f4c1 {proj_name}")
+
+        self.deploy_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(0)
+        self.status_bar.showMessage(f"正在部署 {proj_name} v{latest_ver}...")
+
+        sv_url = self.server_url
+        ver = latest_ver
+
+        class DeployWorker(QThread):
+            progress = pyqtSignal(str)
+            done = pyqtSignal()
+            error = pyqtSignal(str)
+
+            def run(self_):
+                try:
+                    self_.progress.emit("正在下载项目文件...")
+                    resp = requests.get(
+                        f"{sv_url}/api/download/{ver}",
+                        timeout=UPLOAD_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                    self_.progress.emit("正在解压到本地文件夹...")
+                    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        zf.extractall(str(target))
+                    self_.done.emit()
+                except requests.ConnectionError:
+                    self.error.emit("无法连接到服务器")
+                except requests.Timeout:
+                    self.error.emit("下载超时，请重试")
+                except zipfile.BadZipFile:
+                    self.error.emit("下载的版本文件已损坏")
+                except Exception as e:
+                    self.error.emit(f"部署失败: {str(e)}")
+
+        self.dpl_worker = DeployWorker()
+        self.dpl_worker.progress.connect(self._on_deploy_progress)
+        self.dpl_worker.done.connect(lambda: self._on_deploy_done(proj_name, ver, str(target)))
+        self.dpl_worker.error.connect(self._on_deploy_error)
+        self.dpl_worker.start()
+
+    def _on_deploy_progress(self, msg: str):
+        self.status_bar.showMessage(msg)
+
+    def _on_deploy_done(self, proj_name: str, ver: int, path: str):
+        self.deploy_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage(f"部署完成: {proj_name} v{ver}")
+
+        # 更新注册表
+        self.projects_registry[proj_name] = {
+            "local_path": path,
+            "local_version": ver,
+            "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._save_settings()
+        self._refresh_projects()
+        self._refresh_versions()
+        QMessageBox.information(self, "部署成功",
+            f"{proj_name} v{ver} 已部署到:\n{path}")
+
+    def _on_deploy_error(self, msg: str):
+        self.deploy_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("部署失败")
+        QMessageBox.critical(self, "部署失败", msg)
+
+    # ------------------------------------------------------------------
+    # 同步到最新版本（增量）
+    # ------------------------------------------------------------------
+    def _sync_to_latest(self):
+        if not self.local_folder:
+            QMessageBox.warning(self, "提示", "请先选择本地工程文件夹")
+            return
+        if not self.project_name:
+            QMessageBox.warning(self, "提示", "未选择工程")
+            return
+
+        # 找服务端最新版本
+        latest_ver = 0
+        for p in self.server_projects:
+            if p["name"] == self.project_name:
+                latest_ver = p["latest_version"]
+                break
+
+        if latest_ver == 0:
+            QMessageBox.warning(self, "提示", "服务端未找到此工程")
+            return
+
+        reg = self.projects_registry.get(self.project_name, {})
+        local_ver = reg.get("local_version", 0)
+        if local_ver >= latest_ver:
+            QMessageBox.information(self, "已最新",
+                f"本地已是 v{local_ver}，服务端最新 v{latest_ver}，无需同步。")
+            return
+
+        self.status_bar.showMessage(f"正在同步至 v{latest_ver}...")
+        self._do_rollback(latest_ver)
 
     # ------------------------------------------------------------------
     # 提交版本
@@ -1019,6 +1303,15 @@ class MainWindow(QMainWindow):
         self._reset_commit_ui()
         self._refresh_versions()
         self._save_local_manifest(result["version_id"], result.get("manifest", {}))
+        # 更新注册表
+        if self.project_name:
+            self.projects_registry[self.project_name] = {
+                "local_path": self.local_folder,
+                "local_version": result["version_id"],
+                "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._save_settings()
+            self._refresh_projects()
         QMessageBox.information(
             self, "提交成功",
             f"版本 v{result['version_id']} 已保存！\n共 {result['file_count']} 个文件。"
@@ -1220,6 +1513,17 @@ class MainWindow(QMainWindow):
         self.rollback_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage("还原完成")
+        # 更新注册表版本和本地 manifest
+        if self.project_name:
+            ver_id = self.rollback_worker.version_id if hasattr(self, 'rollback_worker') else 0
+            if ver_id:
+                self.projects_registry[self.project_name] = {
+                    "local_path": self.local_folder,
+                    "local_version": ver_id,
+                    "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                self._save_settings()
+                self._refresh_projects()
         QMessageBox.information(
             self, "还原成功",
             f"本地文件已还原到指定版本。\n\n备份位置: {backup_path}"

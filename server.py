@@ -325,6 +325,37 @@ def upload_files():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/projects", methods=["GET"])
+def list_projects():
+    """返回所有项目及其最新版本信息"""
+    try:
+        db = get_db()
+        rows = db.execute("""
+            SELECT v.project_name,
+                   MAX(v.id) as latest_version,
+                   COUNT(f.id) as file_count,
+                   v2.commit_time as last_commit_time
+            FROM versions v
+            LEFT JOIN file_records f ON f.version_id = v.id
+            LEFT JOIN versions v2 ON v2.id = (SELECT MAX(id) FROM versions WHERE project_name = v.project_name)
+            GROUP BY v.project_name
+            ORDER BY v.project_name
+        """).fetchall()
+        projects = []
+        for r in rows:
+            projects.append({
+                "name": r["project_name"],
+                "latest_version": r["latest_version"],
+                "file_count": r["file_count"],
+                "last_commit_time": r["last_commit_time"] or "",
+            })
+        db.close()
+        return jsonify({"projects": projects})
+    except Exception as e:
+        log.exception("list_projects出错")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/versions", methods=["GET"])
 def list_versions():
     try:
