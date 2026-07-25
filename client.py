@@ -465,7 +465,27 @@ class AiRemarkWorker(QThread):
 # ---------------------------------------------------------------------------
 # 版本信息
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.2"  # 仅用于显示，更新检测基于 git commit 对比
+def _get_commit_count() -> int:
+    """从 git 提交次数自动计算版本号（替代手写常量）"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+COMMIT_COUNT = _get_commit_count()
+if COMMIT_COUNT > 0:
+    APP_VERSION = f"1.0.{COMMIT_COUNT}"
+else:
+    APP_VERSION = "未知版本"  # 非 git 部署时回退
 # 本地 git 仓库路径（用于获取本地 HEAD）
 GIT_REPO_PATH = os.path.dirname(os.path.abspath(__file__))
 # 远程仓库 commits API（将 main 改为你的默认分支名）
@@ -1944,6 +1964,12 @@ class MainWindow(QMainWindow):
     # 检查更新（基于 Git commit 对比）
     # ------------------------------------------------------------------
     def _check_update(self):
+        if COMMIT_COUNT == 0:
+            QMessageBox.information(self, "检查更新",
+                "当前为非 Git 部署，不支持自动检测更新。\n\n"
+                "如需更新，请从 GitHub 仓库手动下载最新文件：\n"
+                "https://github.com/Buzaidongqiang/MYSVN")
+            return
         self.status_bar.showMessage("正在检查更新...")
         self.update_worker = UpdateCheckWorker()
         self.update_worker.finished.connect(self._on_update_result)
